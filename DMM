@@ -1,0 +1,618 @@
+
+#include "msp.h"
+#include "COMP.h"
+#include "DCO.h"
+#include "UART.h"
+#include "adc.h"
+#include "math.h"
+
+void UART_init(void);
+void UART_print_string(char string[]);
+void UART_esc_code(char string[]);
+void UART_print_mm(void);
+void UART_values(uint32_t frq, uint32_t dcvolts, uint32_t acvolts, 
+void UART_print(uint8_t character);
+void set_DCO(uint32_t freq);
+uint32_t peakvolts);
+uint32_t minvalue(uint32_t calculation[]);
+uint32_t maxvalue(uint32_t calculation[]);
+void COMP_init(void);
+void TIMERA_COMP_init(void);
+void TIMERA_ADC_init(void);
+void UART_print_num(uint32_t num);
+void ADC14_init(void);
+void ref_gen(uint32_t microvolts);
+void UART_print_volts(uint32_t num);
+volatile uint32_t tau, overflow = 0;
+volatile uint16_t sample[SAMPLES];
+volatile uint16_t i = 0, current = 0, previous = 0;
+uint32_t minimum, rmsvolts, maximum, volts_sq_sum, average, acrms, frequency = 0, optimization, peaktopeak = 0;
+uint8_t convflag = 0;
+uint32_t acvolts[SAMPLES];    
+float floatrms = 0;
+
+
+
+
+
+void main(void)
+{
+    WDT_A->CTL = WDT_A_CTL_PW | WDT_A_CTL_HOLD;                
+    typedef enum {                                                 
+        INIT,                                                
+        SAMPLE,                                                                                                    
+        FREQ, 
+        VOLTS,
+        PRINT
+    } STATE;
+
+    STATE NS = INIT;
+    while(1) {
+        switch(NS) {
+            case INIT: {
+                set_DCO(FREQ_24_MHZ);
+                TIMERA_COMP_init();
+                COMP_init();
+                TIMERA_ADC_init();
+                UART_init();                              
+                UART_print_mm();
+//ENABLE NVIC INTERRUPTS                                  
+                NVIC->ISER[0] |= (1 << (TA0_0_IRQn & 31));         
+                NVIC->ISER[0] |= (1 << (ADC14_IRQn & 31));         
+                NVIC->ISER[0] = (1 << (TA1_N_IRQn & 31));          
+                __enable_irq();                                     //Enable global interrupts
+                NS = SAMPLE;                                    
+                break;
+            }
+
+            case SAMPLE: {
+                TIMER_A0->CCTL[0] |= TIMER_A_CCTLN_CCIE;            //turn on interrupts
+                if (convflag == 1) {                            //conversion flag set high?
+                    convflag = 0;                               //flag reset
+                    TIMER_A0->CCTL[0] &= ~TIMER_A_CCTLN_CCIE;       //disable the interrupts
+                    NS = Volts;                                 
+                    break;
+                }
+                else {
+                    NS = SAMPLE;                                  //wait until finished converting
+                    break;
+                }
+            }
+            case VOLTS: {
+                minimum = calivolt(minvalue(samples));              //find calibrated in value of array
+                maximum = calivolt(maxvalue(samples));              //find calibrated max value of array
+                average = calivolt(avgvalue(samples));                    //find calibrated average value of array
+                ref_gen(average);                                   //Generate the reference voltagessss for the comparator                                                                   
+                rmsvolts = 0;
+                for (i = 0; i < SAMPLES; i++) {
+                    acvolts[i] = calivolt(sample[i]) * calivolt(sample[i])/ 1000;
+                    rmsvolts += acvolts[i];
+                }
+                floatrms =                                                           sqrt((float)rmsvolts / (SAMPLES*1000));  //calculate root meansquare.
+                acrms = floatrms*1000; //convert to milli
+                peaktopeak = maximum - minimum;
+                NS = FREQ;
+                break;
+            }
+            case FREQ: {
+                frequency = (CPU_FREQ)/tau;                                         optimization = (frequency*10000+7166)/10000;        //adjusted value
+                if (optimization < 71) {  //lower range              
+                    optimization ++; //fix for lower values       
+                }
+                NS = PRINT;                                         //Switch states back to SAMPLE to restart the process
+                break;
+            }
+            case PRINT: {
+               UART_print_mm();                                   
+               UART_values(optimization, average, acrms, peaktopeak);
+
+                NS = SAMPLE;
+            }
+
+            default: {
+                NS = INIT;   //should not get here
+                break;
+            }
+        }
+    }
+}
+
+//waveform handler
+void ADC14_IRQHandler(void) {
+    static uint32_t count = 0;
+    if (ADC14->IFGR0 & ADC14_IFGR0_IFG0) {                          //mem interrupt flag check
+        if (count != SAMPLES) {
+            sample[count] = ADC14->MEM[0];                          //save value
+            count++;                                              
+        }
+        else {
+            ADC14->CLRIFGR0 |= ADC14_IFGR0_IFG0;                    //stop conversions
+            count = 0;
+            convflag = 1; //set flag high
+        }
+    }                                                             
+}
+
+//uniform sampling handler
+void TA0_0_IRQHandler(void) {
+    if (TIMER_A0->CCTL[0] & TIMER_A_CCTLN_CCIFG){ //is ccr0 yet?                
+        TIMER_A0->CCTL[0] &= ~TIMER_A_CCTLN_CCIFG; //reset flag                
+        ADC14->CTL0 |= (ADC14_CTL0_ENC  //turn on conversions                            
+                      | ADC14_CTL0_SC);                        
+    }
+}
+
+
+void TA1_N_IRQHandler(void) {
+    if ((TIMER_A1->CCTL[3] & TIMER_A_CCTLN_COV) == 2){
+        TIMER_A1->CCTL[3] &= ~TIMER_A_CCTLN_CCIFG;
+        TIMER_A1->CCTL[3] &= ~TIMER_A_CCTLN_COV;
+        previous = 0;
+        current = 0;
+        tau = 0;
+        overflow = 0;
+
+    }
+    else {
+        if (TIMER_A1->CTL & TIMER_A_CTL_IFG) { //rollover flag
+            TIMER_A1->CTL &= ~TIMER_A_CTL_IFG;
+            overflow++;                                                
+        }
+        if (TIMER_A1->CCTL[3] & TIMER_A_CCTLN_CCIFG) { //read compart       
+            TIMER_A1->CCTL[3] &= ~TIMER_A_CCTLN_CCIFG; //reset flag
+            previous = current;                                        
+            current = TIMER_A1->CCR[3];  //Save current value            
+            tau = ((current - previous) + (overflow * MAXTIME));       
+            overflow = 0;                                              
+        }
+    }
+}
+
+
+=====================================================================
+
+
+
+/*
+ * adc.c
+ *
+ *  Created on: Jun 3, 2021
+ *      Author: Jason Chang
+ */
+#include "msp.h"
+#include "adc.h"
+#include "dco.h"
+
+void ADC14_init(void) {     //initialize the ADC14
+    ADC14->CTL0 &= ~(ADC14_CTL0_ENC);   //disable adc
+    ADCPORT->SEL0 |= AIN;               //set up pins
+    ADCPORT->SEL1 |= AIN;
+    ADC14->CTL0 = ADC14_CTL0_SHP |
+            ADC14_CTL0_DIV__1 |     //adc clock smlk freq
+            ADC14_CTL0_CONSEQ_0 |   //conversion single channel
+            ADC14_CTL0_SSEL__SMCLK |   //SMCLOCK
+            ADC14_CTL0_SHT0__4 |    //sample hold 4 clock cycle
+            ADC14_CTL0_ON;      //turn on adc
+    ADC14->CTL1 = ((ADC14STARTADD << ADC14_CTL1_CSTARTADD_OFS) |
+                ADC14_CTL1_RES__14BIT);  //location 14,resolution 14
+    ADC14->MCTL[0] = (ADC14_MCTLN_VRSEL_0 | ADC14_MCTLN_INCH_0);
+    ADC14->CTL0 |= ADC14_CTL0_ENC; //enable conversions
+    ADC14->IER0 |= ADC14_IER0_IE0; //Enable conversion complete interrupt
+}
+
+uint32_t minvalue(uint32_t array[]) {   //find minimum of an array
+    int min = array[0];
+    int i = 1;
+    for (i = 1; i < SAMPLES; i++) {
+        if (array[i] <= min) {
+            min = array[i];
+        }
+    }
+    return min;
+}
+
+uint32_t maxvalue(uint32_t array[]) {   //find maximum of an array
+    int max = array[0];
+    int i = 1;
+    for (i = 1; i < SAMPLES; i++) {
+        if (array[i] >= max) {
+            max = array[i];
+        }
+    }
+    return max;
+}
+
+uint32_t averagevalue(uint32_t array[]) {   //find average of an array
+    int average = 0;
+    int total = 0;
+    int i = 1;
+    for (i = 0; i < SAMPLES; i++) {
+        total += array[i];
+    }
+    average = (total) / SAMPLES;
+    return average;
+}
+
+uint32_t calivolt(uint32_t volt) {  //calibrated conversion factor
+    uint32_t cali = 0;
+    cali = (1000*(volt - 48.4))/4961.2;
+    return cali;
+}
+
+
+
+
+======================================================================
+
+/*
+ * adc.h
+ *
+ *  Created on: Jun 3, 2021
+ *      Author: Jason Chang
+ */
+
+#ifndef ADC_H_
+#define ADC_H_
+#define COMPPORT P6
+#define COMPOUT P7
+void ADC14_init(void);
+uint32_t minvalue(uint32_t array[]);
+uint32_t maxvalue(uint32_t array[]);
+uint32_t averagevalue(uint32_t array[]);
+uint32_t calivolt(uint32_t volt);
+
+
+#endif /* ADC_H_ */
+
+======================================================================
+
+/*
+ * dco.c
+ *  EE 329
+ *  Created on: May 6, 2021
+ *      Author: jason chang
+ */
+
+#include "dco.h"
+#include "adc.h"
+
+void set_DCO(uint32_t freq) {
+    CS->KEY = CS_KEY_VAL;
+    CS->CTL0 = freq;
+    CS->CTL1 = (CS_CTL1_SELM__DCOCLK | CS_CTL1_DIVS__1 | CS_CTL1_SELS__DCOCLK | CS_CTL1_DIVHS__1);
+    CS->KEY = CS_LOCK;
+}
+
+
+uint16_t DAC_volt_conv(float voltage_dec) { //converts input volt -> mv -> digital sig
+
+    uint16_t dig_num = 0;
+
+    if (voltage_dec > maxvolt) {            //write max value
+        voltage_dec = maxvolt;              //max value = 3.0v
+    }
+
+    if(voltage_dec == 0) {                  //write min value
+        return 0;                           //min value = 0v
+    }
+
+    dig_num = (uint16_t)((voltage_dec * 10) / mvconversion);
+    return dig_num;                         //return converted value
+}
+
+void DAC_init(void) {
+    EUSCI_B2->CTLW0 |= EUSCI_B_CTLW0_SWRST; // set SPI to software reset
+    EUSCI_B2->CTLW0 = (EUSCI_B_CTLW0_MSB |  // send MSB first
+        EUSCI_B_CTLW0_MST |                 // master mode set
+        EUSCI_B_CTLW0_CKPL |                // set clock phase to offset clock
+        EUSCI_B_CTLW0_MODE_0 |              // 3 pin mode
+        EUSCI_B_CTLW0_SYNC |                // synchronous SPI
+        EUSCI_B_CTLW0_SSEL__SMCLK |         // select SMCLK
+        EUSCI_B_CTLW0_SWRST);               // keep software reset
+
+    EUSCI_B2->BRW = 0x01;                   //run clock full speed
+
+    SPI->SEL0 |= (SPI_SCLK | SPI_SDI);     //set spi clock and spi simo p1.5 p1.6
+    SPI->SEL1 &= ~(SPI_SCLK | SPI_SDI);
+
+    SPI->SEL0 &= ~(SPI_CS);              //set gpio
+    SPI->SEL1 &= ~(SPI_CS);
+    SPI->DIR |= SPI_CS;
+    SPI->OUT |= SPI_CS;                  //set cs to start active low
+
+    EUSCI_B2->CTLW0 &= ~(EUSCI_B_CTLW0_SWRST);
+}
+
+void DAC_write(uint16_t inputdata) {     //writes value to the DAC
+    uint8_t lowbyte, highbyte;              //split entry 12 bit
+
+    lowbyte = inputdata & mask;          //mask high bit for bot 4 bit
+    highbyte = (((inputdata >> 8) & mask) | mask1);
+
+    SPI->OUT &= ~(SPI_CS);               //set cs active low
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_TXIFG));  //while no upper transmit
+        EUSCI_B2->TXBUF = highbyte;
+
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_TXIFG));  //write lower byte
+        EUSCI_B2->TXBUF = lowbyte;
+
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_RXIFG));  //turn cs off
+        SPI->OUT |= SPI_CS;
+}
+
+
+
+
+
+
+======================================================================
+
+#include "msp.h"
+#define CPU_FREQ 12000000
+#ifndef SET_DCO_H
+#define SET_DCO_H
+#define FREQ_1_5_MHz CS_CTL0_DCORSEL_0  //1.5 MHz setting
+#define FREQ_3_MHz CS_CTL0_DCORSEL_1    //3 MHz setting
+#define FREQ_6_MHz CS_CTL0_DCORSEL_2    //6 MHz setting
+#define FREQ_12_MHz CS_CTL0_DCORSEL_3   //12 MHz setting
+#define FREQ_24_MHz CS_CTL0_DCORSEL_4   //24 MHz setting
+#define CS_LOCK 0                       //other values should lock CS
+
+
+#define PI 3.14159265                   //number pi
+#define SPI P3                          //set up spi
+#define SPI_SCLK BIT5                   //SPI CLOCK P3.5
+#define SPI_SDI BIT6                   //SPI SIMO P3.6
+#define SPI_CS BIT7                     //SPI CHIP SELECT 3.7
+#define mask 0xFF                       //bit mask
+#define mask1 0x30
+#define reset 000
+#define maxvolt 1000
+#define mvconversion 0.80566            //conversion increment value
+#define TIMER_SPACE 500                 // how many counts
+#define ADCPORT P5
+#define AIN BIT5
+#define SAMPLES 366
+#define ADC14STARTADD 0
+void set_DCO(uint32_t freq);
+void DAC_init(void);
+void DAC_write(uint16_t inputdata);
+uint16_t DAC_volt_conv(float volt_num);
+void MCLK_pin_init(void);
+void set_DCO(uint32_t freq);
+
+#endif /* SET_DCO_H_ */
+
+======================================================================
+
+#include "timera.h"
+#include "DCO.h"
+#include "msp.h"
+
+void timerA_init(void) {
+    TIMER_A1->CTL = (TIMER_A_CTL_IE       |         //enable interrupts
+                     TIMER_A_CTL_ID_0     |         // /1 input divider
+                     TIMER_A_CTL_TASSEL_2 |         //input smclk
+                     TIMER_A_CTL_MC__CONTINUOUS);   //cont. mode
+
+    TIMER_A1->CCTL[3] = (TIMER_A_CCTLN_CM__RISING   |   //rising edge capture
+                         TIMER_A_CCTLN_SCS          |   //synchronize timer clk
+                         TIMER_A_CCTLN_CAP          |   //capture mode
+                         TIMER_A_CCTLN_CCIS__CCIB   |   //input is comparator
+                         TIMER_A_CCTLN_CCIE         |
+                         TIMER_A_CCTLN_OUTMOD_0);           //capture/compare interrupt
+
+}
+
+void TIMERA_ADC_init(void) {
+    TIMER_A0->CCR[0] = 65535;                                             //Count amount is 200 24MHz Clock Cycles
+    TIMER_A0->CTL = (TIMER_A_CTL_TASSEL_2                                   //Run TimerA with SMCLK
+                   | TIMER_A_CTL_MC__UP);                                   //Count with TimerA in UP Mode
+    TIMER_A0->CCTL[0] = TIMER_A_CCTLN_CCIE;                                 //Enable TIMER_A0
+}
+
+======================================================================
+
+#include "msp.h"
+#include "uart.h"
+#include <string.h>
+#include "dco.h"
+#include <stdio.h>
+/**
+ * Assignment 7 main.c
+ * By: Jason Chang
+ */
+int word;
+void UART_init(void);
+void UART_esc_code(char code[]);
+void UART_print_string(char string[]);
+void UART_print_char(char character);
+void set_DCO(uint32_t DCO_FREQ);
+void EUSCIA0_IRQHandler(void);
+
+
+void UART_print(char character) {
+    while(!(EUSCI_A0 -> IFG & EUSCI_A_IFG_TXIFG));
+    EUSCI_A0 -> TXBUF = character;
+}
+
+void UART_print_string(char string[]) {
+    int i = 0;
+    for(i = 0; i < strlen(string); i++) {
+        while(!(EUSCI_A0->IFG & EUSCI_A_IFG_TXIFG));
+        EUSCI_A0 -> TXBUF = string[i];
+    }
+}
+
+void UART_init(void) {
+    EUSCI_A0->CTLW0 |= EUSCI_A_CTLW0_SWRST;
+    EUSCI_A0->CTLW0 = (EUSCI_A_CTLW0_SWRST
+                     | EUSCI_A_CTLW0_SSEL__SMCLK);
+    EUSCI_A0->BRW = 13;
+    EUSCI_A0->MCTLW = (EUSCI_A_MCTLW_OS16);
+    EUSCI_A0->MCTLW |= (0 << EUSCI_A_MCTLW_BRF_OFS);
+    EUSCI_A0->MCTLW |= (0x25 << EUSCI_A_MCTLW_BRS_OFS);
+    UPORT->SEL0 |= (TX | RX);
+    UPORT->SEL1 &= ~(TX | RX);
+
+    EUSCI_A0->CTLW0 &= ~EUSCI_A_CTLW0_SWRST;
+    EUSCI_A0->IE |= EUSCI_A_IE_RXIE;
+}
+
+void UART_print_num(uint32_t num) {
+    uint32_t digits = 1, numf = num, i, send, div = 10, final, prevsend;
+    while (numf /= 10) {    //Run until no digits left
+        digits++;           //Increment the amount of digits
+    }
+    for (i = 1;i < digits - 1; i++) { //division factor
+        div *= 10;
+    }
+    if (digits == 1) {               //For the first digit
+        UART_print(num + ASCII);
+    }
+    else {
+        send = (num / div);          //divide for next #
+        digits--;                    //Decrement digits
+        UART_print(send + ASCII);    //Print the next digit
+        div/=10;    //Divide by 10 to get the next slot
+        prevsend = send;   //Save original data
+        while (digits--) { //Run while digits remain
+            send = (num / div); //next place over
+            final = send - 10*prevsend;  //add extra digit for next print
+            UART_print(final + ASCII);  //Print the final value
+            prevsend = send;            //Save the final value
+            div/= 10;                    //Divide by 10 to get the next highest digit
+        }
+    }
+}
+
+void UART_esc_code (char code[]) {
+    UART_print(0x1B);           //escape part of escape code
+    UART_print_string(code);
+}
+
+void UART_print_mm(void) {
+    uint32_t i = 0;
+    UART_esc_code("[H"); //clear screen
+    UART_esc_code("[3;31H");			//move cursor to correct position
+    UART_esc_code("[35m");//purple text
+    UART_print_string("digital multimeter");//print text
+    UART_esc_code("[37m");//white color text
+    UART_esc_code("[6;5H");			//move cursor to correct position
+    UART_print_string("Frequency (Hz): ");//print text
+    UART_esc_code("[8;5H");			//move cursor to correct position
+    UART_print_string("DC Voltage (V): ");//print text
+    UART_esc_code("[10;5H");			//move cursor to correct position
+    UART_print_string("AC Voltage (V): ");//print text
+    UART_esc_code("[12;5H");			//move cursor to correct position
+    UART_print_string("Peak to Peak Voltage (V): ");//print text
+    UART_esc_code("[20;7H"); 			//move cursor to correct position
+    UART_print('|');	//print bar templates
+    for(i = 0; i < 6; i ++) {
+        UART_print_string("----------|"); //continue bar templates
+    }
+    UART_esc_code("[21;6H");			//move cursor to correct position
+
+    UART_print_string("0.0");		//print bar values
+    UART_print_string("        "); //print bar values
+    UART_print_string("0.5");   //print bar values
+    UART_print_string("        ");// same
+    UART_print_string("1.0");   //same
+    UART_print_string("        "); //same
+    UART_print_string("1.5");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("2.0");		//same						
+    UART_print_string("        ");	//same
+    UART_print_string("2.5");		//same
+    UART_print_string("        ");	//same		
+    UART_print_string("3.0");		//same		
+
+    UART_esc_code("[30;7H");		//move cursor to correct position		
+    UART_print('|');
+    for(i = 0; i < 6; i ++) {
+        UART_print_string("----------|");
+    }
+
+    UART_esc_code("[31;6H");		//move cursor to correct position		
+
+    UART_print_string("0.0");		//print bar values
+    UART_print_string("        "); //same
+    UART_print_string("0.5");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("1.0");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("1.5");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("2.0");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("2.5");		//same
+    UART_print_string("        ");	//same
+    UART_print_string("3.0");		//same		
+
+    UART_esc_code("[25;40H");		//move cursor to correct position
+    UART_print_string("AC");		//print label
+    UART_esc_code("[35;40H");		//move cursor to correct position
+    UART_print_string("DC");		//print label
+}
+
+void UART_bars(uint32_t mvolts) {
+    if ((mvolts > 3000)) {
+        mvolts = 3000;
+    }
+    uint32_t i = 0;
+    uint32_t barnum = (mvolts * (maxbars + 6))/3000;
+    //barnum += (mvolts / 500);
+    UART_esc_code("[31m"); //change text color
+    UART_esc_code("[41m"); //change background color
+    for(i = 0; i < barnum; i++) {
+        UART_print('-'); //print the bars
+    }
+    UART_esc_code("[40m");//reset color of background
+    UART_esc_code("[37m");//rest color of text
+}
+
+void UART_values(uint32_t frq, uint32_t dcvolts, uint32_t acvolts, uint32_t peakvolts) {
+    UART_esc_code(“[H”); //reset cursor
+    UART_esc_code("[6;20H"); //move cursor to correct position
+    UART_print_num(frq); //print frequency number
+    UART_esc_code("[8;20H"); //move cursor to correct position
+    UART_print_volts(dcvolts);//print dc volt number
+    UART_esc_code("[10;20H");//move cursor to correct position
+    UART_print_volts(acvolts); //print ac volt number
+    UART_esc_code("[12;33H");//move cursor to correct position
+    UART_print_volts(peakvolts); //print peak volt number
+    UART_esc_code("[19;8H");//move cursor to correct position
+    UART_esc_code("[2K"); //clear line
+    UART_bars(acvolts);   //ac bar volt line
+    UART_esc_code("[29;8H"); //move cursor to correct position
+    UART_esc_code("[2K"); //clear bar
+    UART_bars(dcvolts); //dc bar volt line
+}
+
+======================================================================
+
+/*
+ * uart.h
+ *
+ *  Created on: May 15, 2021
+ *      Author: jason
+ */
+
+#ifndef UART_H_
+#define UART_H_
+#define UPORT P1            //port 1 for the UART
+#define TX BIT3             //1.3 = tx
+#define RX BIT2             //1.2 = rx
+#define FREQ_3_MHZ CS_CTL0_DCORSEL_1    //dcoclock freq 3MHz
+#define ESC 0x1B // set escape codes
+#define BRACKET 0x5B
+#define ASCII 48
+
+
+
+
+
+#endif /* UART_H_ */
