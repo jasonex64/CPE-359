@@ -1,0 +1,523 @@
+main.c
+#include "msp.h"
+#include "key.h"
+#include "dco.h"
+#include <math.h>
+
+/**Jason Chang
+ * Spring 2021
+ * EE 329
+ * THIS IS A DAC (DIGITAL TO ANALOG CONVERTER)
+ */
+void DAC_init();
+void DAC_write(uint16_t entry_12_bit);
+void set_DCO(uint32_t freq);
+void keypad_init();
+uint16_t DAC_volt_conv(float voltage_dec);
+
+int x = 0;              //initialize variables
+int inputdata[SAMPLES]; //data passed to DAC
+int sinmatrix[SAMPLES]; //SIN matrix
+int trimatrix[SAMPLES]; //TRIANGLE matrix
+int sawmatrix[SAMPLES]; //SAWTOOTH matrix
+int dutycycle;          //duty cycle (only square)
+int32_t btnpress = -1;  //for keypress
+int64_t key = 0;        //for keypress
+int freq = 1, wavetype = 1;
+int dutycycle = 5;
+float wavevalue;
+int volt_DAC;
+int volt_int = 300;
+static int i = 0;
+uint32_t wave = 0;
+
+
+void main(void) {
+    typedef enum {
+
+        INP,
+        SQU,
+        SIN,
+        SAW,
+        TRI,
+        FRQ,
+        DUT,
+
+    }state_type;
+    state_type state = SQU;
+
+    WDT_A->CTL = WDT_A_CTL_PW | WDT_A_CTL_HOLD;// stop watchdog timer
+
+    for (i = 0; i < SAMPLES; i++) {         //make the sin array
+        wavevalue = (150*sin((2*PI*x)/(SAMPLES))) + 150;
+        sinmatrix[i] = DAC_volt_conv(wavevalue);
+        x += 1;                             //equation for sin array
+    }
+    x = 0;
+    for (i = 0; i < SAMPLES; i++) {         //equation for saw array
+        wavevalue = ((x*300)/SAMPLES);
+        sawmatrix[i] = DAC_volt_conv(wavevalue);
+        x += 1;
+    }
+    x = 0;
+    for(i = 0; i < SAMPLES; i++) {          //equation for triangle
+        if(i < (SAMPLES/4)) {
+            wavevalue = (((1.0*600/SAMPLES))*i) + 150;
+        }                                   //need 2 eqs
+        else if((i >= SAMPLES/4)&&(i < (3*SAMPLES)/4)) {
+            wavevalue = 300 - ((1.0*600/SAMPLES)*(i - (SAMPLES/4)));
+        }
+        else {
+            wavevalue = (((1.0*600/SAMPLES))*(i - (3*SAMPLES/4)));
+        }
+        trimatrix[i] = DAC_volt_conv(wavevalue);
+    }
+
+
+
+    set_DCO(FREQ_24_MHz);                   //change clock to 24 MHZ
+    DAC_init();                             //initialize the dac
+    keypad_init();                          //initialize the keypad
+    DAC_write(0x00);
+    TIMER_A0 -> CCR[0] = 200;               //up mode, CCR value
+    TIMER_A0->CTL = (TIMER_A_CTL_TASSEL_2 | TIMER_A_CTL_MC_1); 
+    __enable_irq();                         //enable global interrupt
+    NVIC->ISER[0] = (1 << (TA0_0_IRQn));
+
+    TIMER_A0->CCTL[0] = TIMER_A_CCTLN_CCIE; //initialize the timer
+    while(1){
+       switch(state) {
+       case SQU:                            //square wave state
+           wavetype = 1;                    //wavetype used in IRQ
+       state = INP;                         //go to btnpress state
+           break;
+
+       case SIN:                            //sine wave state
+           TIMER_A0->CCTL[0] = 0;           //disable interrupts  
+           wavetype = 2;                    //wavetype used in IRQ                
+           for(i = 0; i < SAMPLES; i++) {   //no interrupts, long
+               inputdata[i] = sinmatrix[i];
+           }
+           TIMER_A0->CCTL[0] = TIMER_A_CCTLN_CCIE; //enable interrupt
+           state = INP;                     //buttonpress state
+           break;
+
+       case TRI:                            //square wave state
+           TIMER_A0->CCTL[0] = 0;               //disable interrupts 
+           wavetype = 3;                        //wavetype IRQ
+           for(i = 0; i < SAMPLES; i++) {
+               inputdata[i] = trimatrix[i];     //no interrupts, long
+           }
+           TIMER_A0->CCTL[0] = TIMER_A_CCTLN_CCIE; //enable interrupt
+           state = INP;                     //buttonpress state
+           break;
+
+       case SAW:                            //sawtooth wave state
+           TIMER_A0->CCTL[0] = 0;           //disable interrupts
+           wavetype = 4;                    //wavetype used in IRQ
+           for(i = 0; i < SAMPLES; i++) {   //no interrupts, long  
+               inputdata[i] = sawmatrix[i];
+           }
+           TIMER_A0->CCTL[0] = TIMER_A_CCTLN_CCIE;//enable interrupts
+           state = INP;                     //buttonpress state
+           break;
+
+       case INP:                            //await an input
+           key = 0;
+
+           while(1) {
+
+               while(btnpress != -1) {      //debouncer 1st part
+                   btnpress = getkey();
+               }
+               while(btnpress == -1) {      //release button,
+                   btnpress = getkey();
+               }
+
+               key = btnpress;
+
+               if(key == 9) {               //9 = square wave
+                   state = SQU;
+                   break;
+               }
+
+               else if(key == 8) {          //8 = sawtooth wave
+                   state = SAW;
+                   break;
+               }
+
+               else if(key == 7) {          //7 = triangle wave
+                   state = TRI;
+                   break;
+               }
+
+               else if(key == 6) {          //6 = sine wave
+                   state = SIN;
+                   break;
+               }
+
+               else if(key >= 1 && key <= 5) {  //frequency change
+                   state = FRQ;            // go to freq state
+                   break;
+               }
+
+               else if(key == STAR || key == 0 || key == HASHTAG) {
+                   state = DUT;            //duty cycle state
+                   break;
+               }
+           }
+           break;
+
+       case FRQ:
+           freq = key;                     //value from input state
+           state = INP;                    //go back to input
+           break;
+
+       case DUT:
+           if(key == 0) {                  //0 resets dutycycle to 5
+               dutycycle = 5;
+               state = INP;                 //go back to input
+               break;
+           }
+
+           else if(key == STAR && dutycycle > 1) { //min 10 dutycycle
+           dutycycle -= 1;                  //decrease duty cycle  
+               state = INP;                 //go back to input  
+               break;
+           }
+
+           else if(key == HASHTAG && dutycycle < 9) { //max 90 DC
+               dutycycle += 1;              //increase duty cycle     
+               state = INP;                 //go back to input
+               break;
+           }
+
+           state = INP;
+           break;
+
+        default:        //should not get here
+            state = SQU;
+        }
+    }
+}
+
+void TA0_0_IRQHandler(void) {
+        TIMER_A0->CCTL[0] &= ~(TIMER_A_CCTLN_CCIFG);
+                                            //interrupt flag clear
+        static int count = 0;               //start count
+        if(wavetype == 1) {                 //square wave
+            if(count*10 < (SAMPLES * dutycycle)) {  //high or low
+                DAC_write(3723);            //write voltage high
+            }
+            else {
+            DAC_write(0);                           //write voltage low
+            }
+        count += freq;                        //increment count
+        if(count > SAMPLES - 1) {             //is it full period?
+            count = 0;                        //reset count
+            }
+        }
+
+        else if(wavetype == 2 || wavetype == 3 || wavetype == 4) {
+            DAC_write(inputdata[count]);      //write input matrix
+            count += freq;                    //increment count
+            if(count > SAMPLES - 1) {         //is it full period?
+            count = 0;                        //reset count
+            }
+        }
+}
+
+====================================================================
+
+========================================================================
+
+
+
+dco.c
+
+
+#include "dco.h"
+
+void set_DCO(uint32_t freq) {
+    CS->KEY = CS_KEY_VAL;
+    CS->CTL0 = freq;
+    CS->CTL1 = (CS_CTL1_SELM__DCOCLK | CS_CTL1_DIVS__1 | CS_CTL1_SELS__DCOCLK);
+    CS->KEY = CS_LOCK;
+}
+
+
+uint16_t DAC_volt_conv(float voltage_dec) {   //converts input volt -> mv -> digital sig
+
+    uint16_t dig_num = 0;
+
+    if (voltage_dec > maxvolt) {
+        voltage_dec = maxvolt;
+    }
+
+    if(voltage_dec == 0) {
+        return 0;
+    }
+
+    dig_num = (uint16_t)((voltage_dec * 10) / mvconversion);
+    return dig_num;
+}
+
+void DAC_init(void) {
+    EUSCI_B2->CTLW0 |= EUSCI_B_CTLW0_SWRST; // set SPI to software reset
+    EUSCI_B2->CTLW0 = (EUSCI_B_CTLW0_MSB |  // send MSB first
+        EUSCI_B_CTLW0_MST |                 // master mode set
+        EUSCI_B_CTLW0_CKPL |                // set clock phase to offset clock
+        EUSCI_B_CTLW0_MODE_0 |              // 3 pin mode
+        EUSCI_B_CTLW0_SYNC |                // synchronous SPI
+        EUSCI_B_CTLW0_SSEL__SMCLK |         // select SMCLK
+        EUSCI_B_CTLW0_SWRST);               // keep software reset
+
+    EUSCI_B2->BRW = 0x01;                   //run clock full speed
+
+    SPI->SEL0 |= (SPI_SCLK | SPI_SDI);     //set spi clock and spi simo p1.5 p1.6
+    SPI->SEL1 &= ~(SPI_SCLK | SPI_SDI);
+
+    SPI->SEL0 &= ~(SPI_CS);              //set gpio
+    SPI->SEL1 &= ~(SPI_CS);
+    SPI->DIR |= SPI_CS;
+    SPI->OUT |= SPI_CS;                  //set cs to start active low
+
+    EUSCI_B2->CTLW0 &= ~(EUSCI_B_CTLW0_SWRST);
+}
+
+void DAC_write(uint16_t inputdata) {     //writes value to the DAC
+    uint8_t lowbyte, highbyte;              //split entry 12 bit
+
+    lowbyte = inputdata & mask;          //mask high bit for bot 4 bit
+    highbyte = (((inputdata >> 8) & mask) | mask1);
+
+    SPI->OUT &= ~(SPI_CS);               //set cs active low
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_TXIFG));  //while no upper transmit
+        EUSCI_B2->TXBUF = highbyte;
+
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_TXIFG));  //write lower byte
+        EUSCI_B2->TXBUF = lowbyte;
+
+
+    while(!(EUSCI_B2->IFG & EUSCI_B_IFG_RXIFG));  //turn cs off
+        SPI->OUT |= SPI_CS;
+}
+
+
+========================================================================
+
+
+
+
+
+
+
+===========================================================================
+dco.h
+
+#include "msp.h"
+#define CPU_FREQ 12000000
+#ifndef SET_DCO_H
+#define SET_DCO_H
+#define FREQ_1_5_MHz CS_CTL0_DCORSEL_0  //1.5 MHz setting
+#define FREQ_3_MHz CS_CTL0_DCORSEL_1    //3 MHz setting
+#define FREQ_6_MHz CS_CTL0_DCORSEL_2    //6 MHz setting
+#define FREQ_12_MHz CS_CTL0_DCORSEL_3   //12 MHz setting
+#define FREQ_24_MHz CS_CTL0_DCORSEL_4   //24 MHz setting
+#define CS_LOCK 0                       //other values should lock CS
+
+
+#define PI 3.14159265                   //number pi
+#define SPI P3                          //set up spi
+#define SPI_SCLK BIT5                   //SPI CLOCK P3.5
+#define SPI_SDI BIT6                   //SPI SIMO P3.6
+#define SPI_CS BIT7                     //SPI CHIP SELECT 3.7
+#define mask 0xFF                       //bit mask
+#define mask1 0x30
+#define reset 000
+#define maxvolt 1000
+#define mvconversion 0.80566            //conversion increment value
+#define SAMPLES 1200                    //# of samples
+#define TIMER_SPACE 500                 // how many counts
+
+void set_DCO(uint32_t freq);
+void DAC_init(void);
+void DAC_write(uint16_t inputdata);
+uint16_t DAC_volt_conv(float volt_num);
+void MCLK_pin_init(void);
+
+#endif /* SET_DCO_H_ */
+
+
+
+
+
+========================================================================
+
+
+
+
+===========================================================================
+key.c
+#include "msp.h"
+#include "key.h"
+
+void led_init(void) { //set up the LED
+    P2->SEL0 &= ~(RGB_LED); // set LED to GPIO
+    P2->SEL1 &= ~(RGB_LED);
+    P2->DIR |= RGB_LED;    // direction: output
+    P2->OUT &= ~(RGB_LED); // default color: off
+}
+
+void led_light(char color) {
+    P2->OUT &= ~(RGB_LED); // set to 0
+    P2->OUT |= (color & RGB_LED); // turn on LED bits based on char color
+}
+
+void keypad_init(void) {
+    ROW_PORT->SEL0 &= ~(ROW);  // set all keypad pins to GPIO mode
+    ROW_PORT->SEL1 &= ~(ROW);
+    COL_PORT->SEL0 &= ~(COL);
+    COL_PORT->SEL1 &= ~(COL);
+    ROW_PORT->DIR |= (ROW);    // set rows to output (DIR = 1)
+    COL_PORT->DIR &= ~(COL);   // set columns to input (DIR = 0)
+    COL_PORT->REN |= (COL);    // enable pull down resistor (REN = 1)
+    COL_PORT->OUT &= ~(COL);   // set pull down for column inputs (OUT = 0)
+    ROW_PORT->OUT |= (ROW);    // set rows outputs high (OUT = 1)
+}
+
+int8_t getkey(void) {
+    int32_t rows;
+    int32_t cols;
+    int32_t num = -1; // indicates which button number is pressed
+
+    ROW_PORT->OUT |= (ROW); //this sets all HIGH
+    __delay_cycles(25);
+    cols = (COL_PORT->IN) & (COL); // 0 if columns = 0
+    if (cols == 0) {
+        return -1; //no button press
+    }
+    else {
+        ROW_PORT->OUT &= ~(ROW); //set all rows low
+        int i;
+        for (i=0;i<4;i++) {
+            ROW_PORT->OUT &= ~(ROW);
+            ROW_PORT->OUT |= (1<<i); //set ith row high
+            __delay_cycles(25);
+            cols = (COL_PORT->IN & (COL)); // READ COLUMN
+            if (cols != 0) {
+                // assign button number based on row and column
+                rows = (ROW_PORT->OUT & (ROW)); // READ ROW
+                if (!(cols & COL3) && !(rows & ROW3)) { // if within the range 1-9 on keypad:
+                    // change rows to indicate which row number is high
+                    switch (rows) {
+                        case ROW0: //if the top row bit is high:
+                            rows = 0; //indicate in row 0
+                            break;
+                        case ROW1:
+                            rows = 1;
+                            break;
+                        case ROW2:
+                            rows = 2;
+                            break;
+                        default:
+                            rows = -1; // multiple rows pressed
+                    }
+                    // change cols to indicate which column number is high
+                    switch (cols) {
+                        case COL0: //if the left column bit is high:
+                            cols = 0; //indicate column 0
+                            break;
+                        case COL1:
+                            cols = 1;
+                            break;
+                        case COL2:
+                            cols = 2;
+                            break;
+                        default:
+                            rows = -1; // multiple columns pressed
+                    }
+                    num = ((rows * 3 + cols + 1)); // num is a number from 1-9 (convertd to ascii) }
+                else if (rows == ROW3) { //if in the bottom row:
+                    // set num based on the column that's high
+                    switch(cols) {
+                    case COL0: // if the first column bit is high:
+                        num = -6; // *   NEW ASCII VALUE
+                        break;
+                    case COL1:
+                        num = 0;
+                        break;
+                    case COL2:
+                        num = -13; // # NEW ASCII VALUE
+                        break;
+                    case COL3:
+                        num = 20; // D
+                        break;
+                    default:
+                        num = -1; // multiple rows pressed
+                    } //end of switch
+                }  //end of else if
+                else if (cols == COL3) {
+                    switch(rows) {
+                    case ROW0:
+                        num = 17; // A
+                        break;
+                    case ROW1:
+                        num = 18; // B
+                        break;
+                    case ROW2:
+                        num = 19; // C
+                        break;
+                    case ROW3:
+                        num = 20; // D
+                        break;
+                    default:
+                        num = -1; // multiple columns pressed
+                    } //end of switch
+                } //end of else if
+                ROW_PORT->OUT |= (ROW);//return the keypad number
+                return num;
+            } //end of if (cols != 0), go to next row
+        } // end of for loop: (rows > 3)
+    } // end of else statement
+    ROW_PORT->OUT |= (ROW); //set all rows high
+    return -1; //missed button }
+
+========================================================================
+========================================================================
+key.h
+/
+*
+ * key.h
+ *
+ *  Created on: Apr 17, 2021
+ *      Author: jason
+ */
+
+#ifndef KEY_H_
+#define KEY_H_
+
+#define ROW 0x0F       // keypad row is    P4.0 - 4.3
+#define COL 0xF0       // keypad column is P4.4 - 4.7
+#define ROW_PORT P4    // keypad row port    (lower 4 bits)
+#define COL_PORT P4    // keypad column port (upper 4 bits)
+
+#define ROW0 0x01
+#define ROW1 0x02
+#define ROW2 0x04
+#define ROW3 0x08
+
+#define COL0 0x10       // 0b0001_0000
+#define COL1 0x20       // 0b0010_0000
+#define COL2 0x40       // 0b0100_0000
+#define COL3 0x80       // 0b1000_0000
+#define HASHTAG -13
+#define STAR -6
+#define RGB_LED 0x07
+
+#endif /* KEY_H_ */
+
+===========================================================================
+
